@@ -3,18 +3,48 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import os
+import selectors
 import random
 import re
 import shutil
 import subprocess
 import tempfile
+import time
+import zipfile
 from dataclasses import asdict, dataclass
 from pathlib import Path
+from threading import Event
 from typing import Callable
 
 
 class RemixError(ValueError):
     pass
+
+
+class AnalysisCancelled(RemixError):
+    pass
+
+
+@dataclass(frozen=True)
+class AnalysisProgress:
+    stage: str
+    fraction: float
+    processed_seconds: float
+    total_seconds: float
+    elapsed_seconds: float
+    eta_seconds: float | None = None
+    decode_mode: str = 'Logiciel'
+    fallback_reason: str | None = None
+
+
+@dataclass(frozen=True)
+class AnalysisResult:
+    shots: list['Shot']
+    cache_hit: bool
+    requested_decode: str
+    actual_decode: str
+    fallback_reason: str | None = None
 
 
 def run(args: list[str]) -> str:
@@ -68,45 +98,332 @@ class Clip:
     frames: int
 
 
-def detect(path: Path, cache: Path, threshold: float = .30) -> list[Shot]:
-    """Decode locally with FFmpeg's scene score. Cache timestamps, not media."""
+@dataclass(frozen=True)
+class AudioPassage:
+    start: float
+    end: float
+    duration: float
+
+
+def prepare_video_zip(outputs: list[Path], archive_dir: Path,
+                      batch_id: str) -> tuple[Path, int, int]:
+    """Create or reuse a stored ZIP for exactly the supplied MP4 outputs."""
+    if not outputs:
+        raise RemixError('Le lot ne contient aucune vidéo à archiver.')
+    archive_dir = Path(archive_dir).resolve()
+    archive_dir.mkdir(parents=True, exist_ok=True)
+    paths = [Path(output).resolve() for output in outputs]
+    if len(set(paths)) != len(paths):
+        raise RemixError('Le lot contient des vidéos dupliquées.')
+    entries = []
+    for path in paths:
+        if path.parent != archive_dir or path.suffix.lower() != '.mp4' or not path.is_file():
+            raise RemixError(f'Export MP4 manquant ou invalide : {path.name}')
+        stat = path.stat()
+        if stat.st_size <= 0:
+            raise RemixError(f'Export MP4 incomplet ou vide : {path.name}')
+        try:
+            media = probe(path)
+        except (OSError, RemixError, ValueError, json.JSONDecodeError) as error:
+            raise RemixError(f'Export MP4 incomplet ou illisible : {path.name}') from error
+        if not media.get('video') or media.get('video_duration', 0) <= 0:
+            raise RemixError(f'Export MP4 incomplet ou sans vidéo : {path.name}')
+        entries.append({'path': str(path), 'size': stat.st_size,
+                        'mtime_ns': stat.st_mtime_ns})
+    safe_batch_id = re.sub(r'[^A-Za-z0-9._-]+', '-', batch_id).strip('-._') or 'lot'
+    archive = archive_dir / f'clip-remixer-{safe_batch_id}.zip'
+    manifest = archive.with_suffix('.zip.manifest.json')
+    expected = {'entries': entries,
+                'names': [f'edit-{index:03d}.mp4' for index in range(1, len(paths) + 1)]}
+    if archive.is_file() and manifest.is_file():
+        try:
+            if json.loads(manifest.read_text(encoding='utf-8')) == expected:
+                return archive, len(paths), archive.stat().st_size
+        except (OSError, ValueError, TypeError):
+            pass
+    temp_archive = None
+    temp_manifest = None
+    try:
+        with tempfile.NamedTemporaryFile('wb', dir=archive_dir, prefix='.videos-',
+                                         suffix='.zip.tmp', delete=False) as temporary:
+            temp_archive = Path(temporary.name)
+        with zipfile.ZipFile(temp_archive, 'w', compression=zipfile.ZIP_STORED) as bundle:
+            for path, name in zip(paths, expected['names']):
+                bundle.write(path, arcname=name)
+        with tempfile.NamedTemporaryFile('w', encoding='utf-8', dir=archive_dir,
+                                         prefix='.videos-', suffix='.manifest.tmp',
+                                         delete=False) as temporary:
+            temp_manifest = Path(temporary.name)
+            json.dump(expected, temporary, ensure_ascii=False)
+            temporary.flush()
+            os.fsync(temporary.fileno())
+        os.replace(temp_archive, archive)
+        os.replace(temp_manifest, manifest)
+    except (OSError, zipfile.BadZipFile) as error:
+        raise RemixError(f'Impossible de préparer l’archive du lot : {error}') from error
+    finally:
+        if temp_archive:
+            temp_archive.unlink(missing_ok=True)
+        if temp_manifest:
+            temp_manifest.unlink(missing_ok=True)
+    return archive, len(paths), archive.stat().st_size
+
+
+def plan_audio_passages(durations: list[float], audio_duration: float,
+                        start: float = 0, end: float | None = None,
+                        mode: str = 'same', seed: int = 42,
+                        avoid_overlap: bool = False,
+                        minimum_gap: float = 5) -> list[AudioPassage]:
+    """Plan complete, continuous audio passages before any export starts."""
+    if mode not in {'same', 'successive', 'random'}:
+        raise RemixError('Répartition audio invalide.')
+    if not durations or not math.isfinite(audio_duration) or audio_duration <= 0:
+        raise RemixError('Durée audio absente ou invalide.')
+    if not math.isfinite(start) or start < 0:
+        raise RemixError('Le début audio doit être positif ou nul.')
+    usable_end = audio_duration if end is None else end
+    if not math.isfinite(usable_end) or usable_end <= start:
+        raise RemixError('La borne audio doit être supérieure au début.')
+    if not math.isfinite(minimum_gap) or minimum_gap < 0:
+        raise RemixError('L’écart minimal audio doit être positif ou nul.')
+    if any(not math.isfinite(duration) or duration <= 0 for duration in durations):
+        raise RemixError('Durée d’édit invalide pour la planification audio.')
+    if usable_end > audio_duration + 1e-6:
+        raise RemixError(f'La borne de fin ({usable_end:.3f} s) dépasse la durée audio '
+                         f'disponible ({audio_duration:.3f} s).')
+    if any(start + duration > usable_end + 1e-6 for duration in durations):
+        longest = max(durations)
+        raise RemixError(f'Plage audio insuffisante : {usable_end - start:.3f} s disponibles, '
+                         f'{longest:.3f} s nécessaires pour un édit.')
+    if mode == 'same':
+        return [AudioPassage(start, start + duration, duration) for duration in durations]
+    if mode == 'successive':
+        passages = []
+        cursor = start
+        for duration in durations:
+            passages.append(AudioPassage(cursor, cursor + duration, duration))
+            cursor += duration
+        if cursor > usable_end + 1e-6:
+            raise RemixError(f'Passages successifs impossibles : {cursor - start:.3f} s '
+                             f'nécessaires, {usable_end - start:.3f} s disponibles.')
+        return passages
+    gap = max(max(durations) if avoid_overlap else minimum_gap, 1e-6)
+    latest = usable_end - max(durations)
+    required = (len(durations) - 1) * gap
+    if latest - start + 1e-6 < required:
+        constraint = 'sans chevauchement' if avoid_overlap else f'avec un écart minimal de {minimum_gap:g} s'
+        raise RemixError(f'Passages aléatoires impossibles {constraint} : '
+                         f'{usable_end - start:.3f} s disponibles, '
+                         f'{required + max(durations):.3f} s nécessaires.')
+    slack = latest - start - required
+    rng = random.Random(seed)
+    offsets = sorted(rng.uniform(0, slack) for _ in durations)
+    starts = [start + i * gap + offset for i, offset in enumerate(offsets)]
+    return [AudioPassage(value, value + duration, duration)
+            for value, duration in zip(starts, durations)]
+
+
+def _emit_progress(callback: Callable[[AnalysisProgress], None] | None,
+                   value: AnalysisProgress) -> None:
+    if callback:
+        callback(value)
+
+
+def _analysis_dimensions(video: dict, width: int | None) -> tuple[int, int] | None:
+    if width is None:
+        return None
+    if width < 2:
+        raise RemixError('La largeur d’analyse doit être au moins de 2 pixels.')
+    source_width, source_height = int(video['width']), int(video['height'])
+    if source_width <= width:
+        return source_width, source_height
+    return width, max(2, round(source_height * width / source_width / 2) * 2)
+
+
+def _analysis_cache_key(path: Path, threshold: float, analysis_width: int | None,
+                        decode: str) -> str:
+    algorithm = 'scene-v2-progressive'
+    return hashlib.sha256(
+        f'{file_hash(path)}:{threshold}:{analysis_width or "original"}:{decode}:{algorithm}'.encode()
+    ).hexdigest()
+
+
+def _read_analysis_process(process: subprocess.Popen[str], duration: float,
+                           started: float, callback: Callable[[AnalysisProgress], None] | None,
+                           cancel_event: Event | None,
+                           decode_mode: str) -> tuple[list[float], str, bool]:
+    selector = selectors.DefaultSelector()
+    assert process.stdout is not None and process.stderr is not None
+    selector.register(process.stdout, selectors.EVENT_READ, 'progress')
+    selector.register(process.stderr, selectors.EVENT_READ, 'diagnostic')
+    points = [0.0]
+    processed = 0.0
+    tail = ''
+    hardware_seen = False
+    stderr_done = stdout_done = False
+    while not (stderr_done and stdout_done):
+        if cancel_event and cancel_event.is_set():
+            process.terminate()
+            try:
+                process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+            raise AnalysisCancelled('Analyse annulée.')
+        for key, _ in selector.select(timeout=.2):
+            line = key.fileobj.readline()
+            if line == '':
+                selector.unregister(key.fileobj)
+                if key.data == 'progress':
+                    stdout_done = True
+                else:
+                    stderr_done = True
+                continue
+            if key.data == 'progress':
+                match = re.match(r'out_time_ms=(\d+)', line)
+                if match:
+                    processed = max(processed, min(duration, int(match.group(1)) / 1_000_000))
+                    elapsed = time.monotonic() - started
+                    rate = processed / elapsed if processed > 0 else 0
+                    eta = (duration - processed) / rate if rate > .05 and processed < duration else None
+                    _emit_progress(callback, AnalysisProgress(
+                        'analyse', processed / duration, processed, duration, elapsed, eta,
+                        decode_mode))
+            else:
+                tail = (tail + line)[-6000:]
+                hardware_seen = hardware_seen or bool(re.search(
+                    r'videotoolbox_vld|hwaccel.*(?:initialized|used)|'
+                    r'using.*videotoolbox|hardware accelerated', line, re.I))
+                match = re.search(r'\bpts_time:([\d.eE+\-]+)', line)
+                if match:
+                    value = float(match.group(1))
+                    if points[-1] < value < duration:
+                        points.append(value)
+    return points, tail, hardware_seen
+
+
+def detect_result(path: Path, cache: Path, threshold: float = .30,
+                  analysis_width: int | None = 640, decode: str = 'auto',
+                  progress: Callable[[AnalysisProgress], None] | None = None,
+                  cancel_event: Event | None = None) -> AnalysisResult:
+    """Analyse scene changes from the source, optionally after CPU scaling."""
     if not .01 <= threshold <= 1:
         raise RemixError('Le seuil doit être compris entre 0.01 et 1.')
+    if decode not in {'auto', 'software', 'videotoolbox'}:
+        raise RemixError('Mode de décodage invalide.')
     info = probe(path)
     if not info['video'] or info.get('video_duration', 0) <= 0:
         raise RemixError('Vidéo absente ou durée inconnue.')
     cache.mkdir(parents=True, exist_ok=True)
-    key = hashlib.sha256(f'{file_hash(path)}:{threshold}:scene-v1'.encode()).hexdigest()
+    requested = {'auto': 'Auto', 'software': 'Logiciel', 'videotoolbox': 'VideoToolbox'}[decode]
+    last_fraction = 0.0
+
+    def report(value: AnalysisProgress) -> None:
+        nonlocal last_fraction
+        fraction = max(last_fraction, min(1., value.fraction))
+        last_fraction = fraction
+        _emit_progress(progress, AnalysisProgress(
+            value.stage, fraction, max(value.processed_seconds, fraction * info['video_duration']),
+            value.total_seconds, value.elapsed_seconds, value.eta_seconds,
+            value.decode_mode, value.fallback_reason))
+
+    key = _analysis_cache_key(path, threshold, analysis_width, decode)
     saved = cache / f'{key}.json'
     if saved.exists():
         try:
-            return [Shot(**row) for row in json.loads(saved.read_text())]
-        except (ValueError, TypeError):
+            cached = json.loads(saved.read_text())
+            if isinstance(cached, dict):
+                rows = cached['shots']
+                cached_actual = cached.get('actual_decode', requested)
+                cached_fallback = cached.get('fallback_reason')
+            else:
+                rows, cached_actual, cached_fallback = cached, requested, None
+            shots = [Shot(**row) for row in rows]
+            report(AnalysisProgress(
+                'résultat en cache', 1, info['video_duration'], info['video_duration'], 0,
+                0, cached_actual, cached_fallback))
+            return AnalysisResult(shots, True, requested, cached_actual, cached_fallback)
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
             saved.unlink(missing_ok=True)
-    # Log to disk to avoid buffering per-frame diagnostic output in RAM.
-    with tempfile.TemporaryFile(mode='w+') as log:
-        result = subprocess.run(['ffmpeg', '-hide_banner', '-nostdin', '-threads', '2',
-            '-i', str(Path(path).resolve()), '-map', '0:V:0', '-an', '-sn', '-dn',
-            '-vf', f"setpts=PTS-STARTPTS,select='gt(scene,{threshold})',showinfo",
-            '-fps_mode', 'vfr', '-f', 'null', '-'], stdout=subprocess.DEVNULL, stderr=log)
-        log.seek(0)
-        points = [0.0]
-        tail = ''
-        for line in log:
-            tail = (tail + line)[-6000:]
-            match = re.search(r'\bpts_time:([\d.eE+\-]+)', line)
-            if match:
-                value = float(match.group(1))
-                if points[-1] < value < info['video_duration']:
-                    points.append(value)
-        if result.returncode:
-            raise RemixError(tail)
+    report(AnalysisProgress(
+        'lecture/empreinte', 0, 0, info['video_duration'], 0, None, requested))
+    dimensions_for_analysis = _analysis_dimensions(info['video'], analysis_width)
+    video_filter = '[0:V:0]setpts=PTS-STARTPTS,split=2[scene][clock];'
+    if dimensions_for_analysis:
+        width, height = dimensions_for_analysis
+        video_filter += (f'[scene]scale={width}:{height},'
+                         f'select=\'gt(scene,{threshold})+eq(n,0)\',showinfo[detected];')
+    else:
+        video_filter += f'[scene]select=\'gt(scene,{threshold})+eq(n,0)\',showinfo[detected];'
+    video_filter += '[clock]null[clockout]'
+    base = ['ffmpeg', '-hide_banner', '-loglevel', 'verbose', '-nostdin', '-threads', '2',
+            '-progress', 'pipe:1',
+            '-stats_period', '250ms']
+    if decode in {'auto', 'videotoolbox'}:
+        base += ['-hwaccel', 'videotoolbox']
+    base += ['-i', str(Path(path).resolve()), '-filter_complex', video_filter,
+             '-map', '[detected]', '-an', '-sn', '-dn', '-fps_mode', 'vfr', '-f', 'null', '-',
+             '-map', '[clockout]', '-an', '-sn', '-dn', '-f', 'null', '-']
+    actual = 'VideoToolbox' if decode in {'auto', 'videotoolbox'} else 'Logiciel'
+    fallback_reason = None
+    started = time.monotonic()
+    try:
+        process = subprocess.Popen(base, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                   text=True, bufsize=1)
+        points, tail, hardware_seen = _read_analysis_process(
+            process, info['video_duration'], started, report, cancel_event, actual)
+        return_code = process.wait()
+        if return_code:
+            raise RemixError(tail or 'Échec du décodage FFmpeg.')
+        if decode in {'auto', 'videotoolbox'} and not hardware_seen:
+            actual = 'Logiciel'
+            fallback_reason = 'FFmpeg n’a pas confirmé l’utilisation de VideoToolbox.'
+    except (OSError, RemixError) as error:
+        if decode not in {'auto', 'videotoolbox'} or isinstance(error, AnalysisCancelled):
+            raise
+        fallback_reason = str(error)
+        report(AnalysisProgress(
+            'analyse', 0, 0, info['video_duration'], time.monotonic() - started,
+            None, 'Logiciel', fallback_reason))
+        process = subprocess.Popen(
+            ['ffmpeg', '-hide_banner', '-loglevel', 'verbose', '-nostdin', '-threads', '2',
+             '-progress', 'pipe:1',
+             '-stats_period', '250ms', '-i', str(Path(path).resolve()),
+             '-filter_complex', video_filter, '-map', '[detected]', '-an', '-sn', '-dn',
+             '-fps_mode', 'vfr', '-f', 'null', '-', '-map', '[clockout]', '-an', '-sn',
+             '-dn', '-f', 'null', '-'], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, bufsize=1)
+        points, tail, _ = _read_analysis_process(
+            process, info['video_duration'], time.monotonic(), report, cancel_event, 'Logiciel')
+        if process.wait():
+            raise RemixError(tail or 'Échec du décodage logiciel FFmpeg.')
+        actual = 'Logiciel'
     points.append(info['video_duration'])
     shots = [Shot(i, a, b) for i, (a, b) in enumerate(zip(points, points[1:])) if b > a]
-    temporary = saved.with_suffix('.tmp')
-    temporary.write_text(json.dumps([asdict(s) for s in shots]))
-    temporary.replace(saved)
-    return shots
+    temporary_name = None
+    try:
+        with tempfile.NamedTemporaryFile('w', encoding='utf-8', dir=cache,
+                                         prefix=f'.{key}.', suffix='.tmp', delete=False) as temporary:
+            temporary_name = temporary.name
+            json.dump({'shots': [asdict(s) for s in shots],
+                       'actual_decode': actual, 'fallback_reason': fallback_reason}, temporary)
+            temporary.flush()
+            os.fsync(temporary.fileno())
+        os.replace(temporary_name, saved)
+    finally:
+        if temporary_name:
+            Path(temporary_name).unlink(missing_ok=True)
+    report(AnalysisProgress(
+        'finalisation', 1, info['video_duration'], info['video_duration'],
+        time.monotonic() - started, 0, actual, fallback_reason))
+    return AnalysisResult(shots, False, requested, actual, fallback_reason)
+
+
+def detect(path: Path, cache: Path, threshold: float = .30,
+           analysis_width: int | None = 640, decode: str = 'auto',
+           progress: Callable[[AnalysisProgress], None] | None = None,
+           cancel_event: Event | None = None) -> list[Shot]:
+    return detect_result(path, cache, threshold, analysis_width, decode, progress, cancel_event).shots
 
 
 def plan(shots: list[Shot], duration: float = 20, fps: int = 30,
